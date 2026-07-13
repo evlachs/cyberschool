@@ -1,0 +1,5 @@
+{"station_id":"pk7","role":"endpoint","display_name":"Точка Б (отправитель/получатель)",
+ "listen_host":"127.0.0.1","listen_port":6007,
+ "peer_host":"127.0.0.1","peer_port":6006,
+ "send_direction":"left",
+ "master_host":"127.0.0.1","master_port":7000}

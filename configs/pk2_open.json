@@ -1,0 +1,7 @@
+{"station_id":"pk2","role":"cipher","display_name":"Шифроузел A",
+ "listen_host":"127.0.0.1","listen_port":6002,
+ "peer_left_host":"127.0.0.1","peer_left_port":6001,
+ "peer_right_host":"127.0.0.1","peer_right_port":6003,
+ "cipher_type":"open","cipher_key":null,
+ "encrypt_direction":"right",
+ "master_host":"127.0.0.1","master_port":7000}

@@ -1,0 +1,5 @@
+{"station_id":"pk4","role":"impostor","display_name":"Крот",
+ "listen_host":"127.0.0.1","listen_port":6004,
+ "peer_left_host":"127.0.0.1","peer_left_port":6003,
+ "peer_right_host":"127.0.0.1","peer_right_port":6005,
+ "master_host":"127.0.0.1","master_port":7000}

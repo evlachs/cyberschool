@@ -1,0 +1,7 @@
+{"station_id":"pk6","role":"cipher","display_name":"Шифроузел Б",
+ "listen_host":"127.0.0.1","listen_port":6006,
+ "peer_left_host":"127.0.0.1","peer_left_port":6005,
+ "peer_right_host":"127.0.0.1","peer_right_port":6007,
+ "cipher_type":"open","cipher_key":null,
+ "encrypt_direction":"left",
+ "master_host":"127.0.0.1","master_port":7000}

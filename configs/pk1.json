@@ -1,0 +1,5 @@
+{"station_id":"pk1","role":"endpoint","display_name":"Точка А (отправитель/получатель)",
+ "listen_host":"127.0.0.1","listen_port":6001,
+ "peer_host":"127.0.0.1","peer_port":6002,
+ "send_direction":"right",
+ "master_host":"127.0.0.1","master_port":7000}
