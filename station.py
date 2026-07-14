@@ -160,13 +160,13 @@ def forward(config, direction, msg_id, origin, phase, content, meta):
 # Обработчики входящих сообщений по ролям
 # возвращают (outgoing_content_or_None, extra_meta, action_label, forward_direction_or_None)
 # ---------------------------------------------------------------------------
-def h_endpoint(msg, state, config):
+def h_endpoint(msg, state, config, master_link):
     state.setdefault("inbox", []).append(msg)
     print(f"\n>>> ПОЛУЧЕНО СООБЩЕНИЕ: {msg['content']}\n")
     return None, {}, "доставлено (конец цепочки для этого сообщения)", None
 
 
-def h_cipher(msg, state, config):
+def h_cipher(msg, state, config, master_link):
     content = msg["content"]
     direction = msg["direction"]
     algo, key = state.get("algorithm"), state.get("key")
@@ -187,7 +187,7 @@ def h_cipher(msg, state, config):
     return out, {"algorithm": algo}, action, direction
 
 
-def h_database(msg, state, config):
+def h_database(msg, state, config, master_link):
     h = crypto.content_hash(msg["content"])
     state.setdefault("log", []).append({
         "msg_id": msg["msg_id"], "hash": h, "content": msg["content"],
@@ -219,7 +219,49 @@ def handle_db_message(msg):
     print(f"\n>>> СООБЩЕНИЕ ОТ {msg.get('from')}: {msg.get('text')}\n")
 
 
-def h_impostor(msg, state, config):
+def impostor_decrypt(state, text):
+    """Расшифровать text запомненным рабочим шифром крота (use_cipher), либо None, если он не задан."""
+    c = state.get("impostor_cipher")
+    if not c:
+        return None
+    if c["algo"] == "caesar":
+        return crypto.caesar_decrypt(text, c["key"])
+    return crypto.xor_decrypt(text, c["key"])
+
+
+def impostor_encrypt(state, text):
+    """Зашифровать text запомненным рабочим шифром крота; без него — вернуть как есть (passthrough)."""
+    c = state.get("impostor_cipher")
+    if not c:
+        return text
+    if c["algo"] == "caesar":
+        return crypto.caesar_encrypt(text, c["key"])
+    return crypto.xor_encrypt(text, c["key"])
+
+
+# Сколько времени даётся кроту на решение по каждому сообщению в ручном режиме, прежде чем
+# оно уйдёт само без изменений. Оверрайд переменной окружения — иначе test_harness.py ждал бы
+# 60 реальных секунд, чтобы проверить автосброс по таймауту.
+PENDING_TIMEOUT_SECONDS = float(os.environ.get("PEREHVAT_PENDING_TIMEOUT", "60"))
+
+
+def _impostor_schedule_timeout(mid, state, config, master_link):
+    """Через PENDING_TIMEOUT_SECONDS, если сообщение всё ещё в pending (оператор не успел
+    среагировать), отпустить его автоматически без изменений — таймер стартует сразу при
+    попадании сообщения в pending в ручном режиме."""
+    def _on_timeout():
+        with state_lock:
+            if mid not in state.get("pending", {}):
+                return  # уже отпущено оператором вручную
+            _impostor_release_one(mid, state, config, master_link, replacement=None, auto=True)
+    timer = threading.Timer(PENDING_TIMEOUT_SECONDS, _on_timeout)
+    timer.daemon = True
+    timer.start()
+    state.setdefault("pending_timers", {})[mid] = timer
+    state.setdefault("pending_deadline", {})[mid] = time.time() + PENDING_TIMEOUT_SECONDS
+
+
+def h_impostor(msg, state, config, master_link):
     state.setdefault("captured", []).append({
         "msg_id": msg["msg_id"], "content": msg["content"],
         "phase": msg.get("phase"), "direction": msg.get("direction"),
@@ -227,16 +269,11 @@ def h_impostor(msg, state, config):
     if state.get("manual_mode"):
         # В ручном режиме сообщение НЕ пересылается автоматически — оседает в pending,
         # оператор сам решает через release <id> [текст], когда и в каком виде его отпустить.
+        # Даётся PENDING_TIMEOUT_SECONDS: не успел — сообщение уйдёт само, без изменений.
         state.setdefault("pending", {})[msg["msg_id"]] = msg
-        return None, {}, "получено, ждёт решения оператора (ручной режим)", None
-    outgoing = msg["content"]
-    action = "перехвачено, переслано без изменений"
-    tamper = state.get("tamper_next")
-    if tamper is not None:
-        outgoing = tamper
-        state["tamper_next"] = None
-        action = "‼ ПОДМЕНЕНО перед пересылкой"
-    return outgoing, {}, action, msg["direction"]
+        _impostor_schedule_timeout(msg["msg_id"], state, config, master_link)
+        return None, {}, f"получено, ждёт решения оператора (до {int(PENDING_TIMEOUT_SECONDS)}с)", None
+    return msg["content"], {}, "перехвачено, переслано без изменений", msg["direction"]
 
 
 ROLE_HANDLERS = {
@@ -253,7 +290,7 @@ ROLE_HANDLERS = {
 def process_incoming(msg, config, state, master_link):
     handler = ROLE_HANDLERS[config["role"]]
     with state_lock:
-        outgoing, meta, action, out_direction = handler(msg, state, config)
+        outgoing, meta, action, out_direction = handler(msg, state, config, master_link)
     # На консоль — содержимое целиком (без preview): оператору, особенно кроту, важно видеть
     # сообщение полностью, чтобы решить, подменять ли его. Урезаем только то, что уходит на
     # панель мастера (см. master_link.log ниже) — там компактность нужна намеренно.
@@ -337,7 +374,11 @@ def cmd_impostor_list(args, state, config, master_link):
     n = int(args[0]) if args else 10
     print(f"--- перехвачено {len(cap)} сообщений, последние {n} ---")
     for entry in cap[-n:]:
-        print(f"  id={entry['msg_id']} [{entry['phase']}/{entry['direction']}] «{entry['content']}»")
+        line = f"  id={entry['msg_id']} [{entry['phase']}/{entry['direction']}] «{entry['content']}»"
+        dec = impostor_decrypt(state, entry["content"])
+        if dec is not None:
+            line += f"  ->  «{dec}»"
+        print(line)
 
 
 def cmd_impostor_show(args, state, config, master_link):
@@ -347,6 +388,10 @@ def cmd_impostor_show(args, state, config, master_link):
     for entry in state.get("captured", []):
         if entry["msg_id"] == args[0]:
             print(f"id={entry['msg_id']} [{entry['phase']}/{entry['direction']}]\n{entry['content']}")
+            dec = impostor_decrypt(state, entry["content"])
+            if dec is not None:
+                c = state["impostor_cipher"]
+                print(f"расшифровано ({c['algo']}, ключ={c['key']!r}): {dec}")
             return
     print("не найдено")
 
@@ -379,18 +424,6 @@ def cmd_crack_xor(args, state, config, master_link):
     print(f"ключ '{args[1]}': {crypto.xor_decrypt(entry['content'], args[1])}")
 
 
-def cmd_tamper_next(args, state, config, master_link):
-    if not args:
-        print("использование: tamper_next <новый текст> (подменит СЛЕДУЮЩЕЕ пришедшее сообщение)")
-        return
-    if state.get("manual_mode"):
-        print("сейчас включён ручной режим (manual on) — используйте release <id> <текст> "
-              "вместо tamper_next, там видно содержимое до решения")
-        return
-    state["tamper_next"] = " ".join(args)
-    print("подмена подготовлена, сработает на следующем входящем сообщении")
-
-
 def cmd_impostor_manual(args, state, config, master_link):
     if not args:
         print(f"ручной режим: {'ВКЛЮЧЁН' if state.get('manual_mode') else 'выключен'}")
@@ -398,14 +431,16 @@ def cmd_impostor_manual(args, state, config, master_link):
     val = args[0].lower()
     if val in ("on", "вкл"):
         state["manual_mode"] = True
-        print("ручной режим ВКЛЮЧЁН: входящие сообщения теперь оседают в pending "
-              "и ждут вашей команды release, автоматической пересылки больше нет")
+        print(f"ручной режим ВКЛЮЧЁН: входящие сообщения теперь оседают в pending "
+              f"и ждут вашей команды release — но не дольше {int(PENDING_TIMEOUT_SECONDS)}с, "
+              f"иначе уйдут сами без изменений")
     elif val in ("off", "выкл"):
         state["manual_mode"] = False
         pending = state.get("pending", {})
         if pending:
-            print(f"ручной режим ВЫКЛЮЧЕН. Внимание: {len(pending)} сообщений всё ещё в pending "
-                  f"и НЕ дойдут до адресата сами — отпустите их (release <id> или release_all)")
+            print(f"ручной режим ВЫКЛЮЧЕН. {len(pending)} сообщений всё ещё в pending — каждое "
+                  f"само уйдёт без изменений по истечении своего таймера, либо отпустите их раньше "
+                  f"(release <id> или release_all)")
         else:
             print("ручной режим ВЫКЛЮЧЕН: входящие снова пересылаются автоматически")
     else:
@@ -417,22 +452,68 @@ def cmd_impostor_pending(args, state, config, master_link):
     if not pending:
         print("нет сообщений, ожидающих решения")
         return
+    deadlines = state.get("pending_deadline", {})
     print(f"--- ожидают решения ({len(pending)}) ---")
     for mid, m in pending.items():
-        print(f"  id={mid} [{m.get('phase')}/{m.get('direction')}] «{m['content']}»")
+        remaining = max(0, int(deadlines.get(mid, time.time()) - time.time()))
+        line = f"  id={mid} [{m.get('phase')}/{m.get('direction')}] ещё {remaining}с «{m['content']}»"
+        dec = impostor_decrypt(state, m["content"])
+        if dec is not None:
+            line += f"  ->  «{dec}»"
+        print(line)
 
 
-def _impostor_release_one(mid, state, config, master_link, replacement=None):
+def cmd_impostor_use_cipher(args, state, config, master_link):
+    if not args:
+        c = state.get("impostor_cipher")
+        if c:
+            print(f"текущий рабочий шифр: {c['algo']}, ключ={c['key']!r}")
+        else:
+            print("рабочий шифр не задан. использование: use_cipher <caesar|xor> <ключ> | use_cipher off")
+        return
+    if args[0].lower() == "off":
+        state["impostor_cipher"] = None
+        print("рабочий шифр сброшен — pending/show/list снова без расшифровки, release без авто-шифрования")
+        return
+    if len(args) < 2:
+        print("использование: use_cipher <caesar|xor> <ключ>")
+        return
+    algo = args[0].lower()
+    if algo not in ("caesar", "xor"):
+        print("алгоритм должен быть caesar или xor")
+        return
+    key_raw = " ".join(args[1:])
+    if algo == "caesar":
+        try:
+            key = int(key_raw)
+        except ValueError:
+            print("для caesar ключ должен быть целым числом (сдвиг)")
+            return
+    else:
+        key = key_raw
+    state["impostor_cipher"] = {"algo": algo, "key": key}
+    print(f"рабочий шифр запомнен: {algo}, ключ={key!r}. Теперь pending/show/list сразу показывают "
+          f"расшифровку, а release <id> <текст> сам зашифрует вашу подмену этим ключом перед отправкой.")
+
+
+def _impostor_release_one(mid, state, config, master_link, replacement=None, auto=False):
     m = state.get("pending", {}).pop(mid, None)
     if not m:
         print(f"нет id={mid} среди ожидающих")
         return
+    timer = state.get("pending_timers", {}).pop(mid, None)
+    if timer:
+        timer.cancel()
+    state.get("pending_deadline", {}).pop(mid, None)
     if replacement is not None:
-        outgoing = replacement
+        outgoing = impostor_encrypt(state, replacement)
         action = "‼ ПОДМЕНЕНО вручную перед пересылкой"
+        if state.get("impostor_cipher"):
+            print(f"[авто-шифрование] «{replacement}» -> «{outgoing}»")
     else:
         outgoing = m["content"]
-        action = "переслано вручную без изменений"
+        action = f"время вышло ({int(PENDING_TIMEOUT_SECONDS)}с) — переслано автоматически без изменений" \
+            if auto else "переслано вручную без изменений"
     print(f"[{protocol.now_iso()}] отпускаю id={mid}: «{outgoing}» -> {action}")
     master_link.log(action=action, in_preview=None, out_preview=preview(outgoing))
     forward(config, m["direction"], mid, m.get("origin", config["station_id"]),
@@ -472,9 +553,9 @@ ROLE_COMMANDS = {
     "impostor": {
         "list": cmd_impostor_list, "show": cmd_impostor_show,
         "crack_caesar": cmd_crack_caesar, "crack_xor": cmd_crack_xor,
-        "tamper_next": cmd_tamper_next, "manual": cmd_impostor_manual,
+        "manual": cmd_impostor_manual,
         "pending": cmd_impostor_pending, "release": cmd_impostor_release,
-        "release_all": cmd_impostor_release_all,
+        "release_all": cmd_impostor_release_all, "use_cipher": cmd_impostor_use_cipher,
     },
 }
 
@@ -492,10 +573,14 @@ ROLE_HELP = {
                  "show <msg_id>           — показать сообщение целиком\n"
                  "crack_caesar <id> [сдвиг] — расшифровать/перебрать сдвиги Цезаря\n"
                  "crack_xor <id> <ключ>    — попробовать XOR-ключ\n"
-                 "tamper_next <текст>     — подменить следующее пришедшее сообщение (только в автоматическом режиме)\n"
-                 "manual [on|off]         — ручной режим: входящие не пересылаются сами, ждут вашего release\n"
-                 "pending                 — показать сообщения, ожидающие решения (в ручном режиме)\n"
+                 "use_cipher <caesar|xor> <ключ> — запомнить рабочий шифр на текущую фазу: pending/show/list\n"
+                 "                          сразу покажут расшифровку, release сам зашифрует подмену.\n"
+                 "                          use_cipher off — сбросить, use_cipher без аргументов — посмотреть\n"
+                 "manual [on|off]         — ручной режим: входящие не пересылаются сами, ждут вашего release,\n"
+                 "                          но не дольше 60с — иначе уйдут сами без изменений\n"
+                 "pending                 — показать сообщения, ожидающие решения, и сколько секунд осталось\n"
                  "release <id> [текст]    — отпустить сообщение: без текста — как есть, с текстом — подмена\n"
+                 "                          (текст автоматически шифруется, если задан use_cipher)\n"
                  "release_all             — отпустить все ожидающие без изменений"),
 }
 

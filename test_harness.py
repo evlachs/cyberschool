@@ -11,7 +11,9 @@ ROOT = os.path.dirname(os.path.abspath(__file__))
 # Станции ждут 2с перед каждой пересылкой (см. station.py, FORWARD_DELAY_SECONDS) —
 # на полном маршруте pk1->pk7 (6 хопов) это 12+ секунд на одну отправку. В тесте это
 # ни на что не влияет по сути, только замедляет прогон, поэтому здесь отключаем.
-STATION_ENV = dict(os.environ, PEREHVAT_FORWARD_DELAY="0")
+# PEREHVAT_PENDING_TIMEOUT сокращаем до 3с (вместо боевых 60с) — иначе тест автосброса
+# крота по таймауту ждал бы минуту по-настоящему.
+STATION_ENV = dict(os.environ, PEREHVAT_FORWARD_DELAY="0", PEREHVAT_PENDING_TIMEOUT="3")
 
 procs = {}
 out_queues = {}
@@ -174,17 +176,50 @@ try:
         time.sleep(0.3)
         print("PK4 crack:", drain("pk4"))
 
-    # --- tamper_next всё ещё работает при двунаправленной схеме ---
+    # --- use_cipher: pending/show/list показывают расшифровку, release сам шифрует подмену ---
+    # (manual_mode сейчас выключен — включён и выключен обратно в самом первом тесте выше)
     restart_cipher_pair("pk2_caesar_example.json", "pk6_caesar_example.json")
-    send("pk4", "tamper_next ПОДМЕНА")
+    send("pk4", "manual on")
+    send("pk4", "use_cipher caesar 13")
     time.sleep(0.2)
-    send("pk1", "send оригинал")
+    send("pk1", "phase cipher1")
+    send("pk1", "send секретное сообщение")
+    time.sleep(0.6)
+    drain("pk7")
+    send("pk4", "pending")
+    time.sleep(0.3)
+    pending_out = drain("pk4")
+    print("PK4 pending (с расшифровкой):", pending_out)
+    assert any("секретное сообщение" in l for l in pending_out), \
+        "use_cipher не расшифровал содержимое в pending!"
+    msg_id2 = next((l.strip().split()[0].split("=")[1] for l in pending_out if l.strip().startswith("id=")), None)
+    assert msg_id2, f"не нашли id в pending: {pending_out}"
+    send("pk4", f"release {msg_id2} ложные координаты")
     time.sleep(0.6)
     out = drain("pk7")
-    print("PK7 после tamper:", out)
-    assert any("ПОЛУЧЕНО" in l for l in out) and not any("оригинал" in l for l in out), \
-        "tamper_next не сработал в двунаправленной схеме!"
-    print("OK: tamper_next по-прежнему работает")
+    print("PK7 после release с use_cipher:", out)
+    assert any("ложные координаты" in l for l in out), \
+        "release не доставил расшифрованную (получателем) версию подмены — авто-шифрование не сработало!"
+    assert not any("секретное сообщение" in l for l in out), "оригинал всё же дошёл!"
+    print("OK: use_cipher — pending показал расшифровку, release сам зашифровал подмену")
+
+    # --- ручной режим: не отпущенное вовремя сообщение уходит само без изменений ---
+    send("pk4", "use_cipher off")
+    send("pk1", "send сообщение без ответа")
+    time.sleep(0.6)
+    out = drain("pk7")
+    assert not any("сообщение без ответа" in l for l in out), \
+        "сообщение прошло сразу, хотя должно было ждать в pending до таймаута!"
+    drain("pk4")
+    time.sleep(3.5)  # PEREHVAT_PENDING_TIMEOUT=3с в STATION_ENV — ждём автосброса
+    out = drain("pk7")
+    print("PK7 после истечения таймера:", out)
+    assert any("сообщение без ответа" in l for l in out), \
+        "сообщение не пришло само после истечения таймера ожидания!"
+    print("OK: таймаут pending — неотпущенное сообщение ушло само без изменений")
+
+    send("pk4", "manual off")
+    time.sleep(0.2)
 
     # --- msg: pk3<->pk5 напрямую (в обход цепочки), свободный текст, без автосверки ---
     send("pk3", "msg хэш для id=abc123 у меня 74949de281c3, сверь у себя")
